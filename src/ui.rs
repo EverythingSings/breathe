@@ -1,3 +1,4 @@
+use crate::config::Config;
 use crate::pattern::Pattern;
 use crossterm::event::{self, Event, KeyCode, KeyEventKind};
 use ratatui::{
@@ -30,24 +31,75 @@ fn lerp_color(a: (u8, u8, u8), b: (u8, u8, u8), t: f64) -> Color {
     )
 }
 
-// Base colors — these deepen as the session progresses
-const COLOR_INHALE: (u8, u8, u8) = (90, 140, 190);   // cool blue — alertness, expansion
-const COLOR_EXHALE: (u8, u8, u8) = (185, 145, 85);   // warm amber — release, warmth
-const COLOR_HOLD: (u8, u8, u8) = (110, 140, 120);     // sage — stillness
 const COLOR_DIM: (u8, u8, u8) = (50, 50, 55);
 const COLOR_DONE: (u8, u8, u8) = (100, 130, 110);
 
-// Deepened colors — richer versions reached ~halfway through a session
-const COLOR_INHALE_DEEP: (u8, u8, u8) = (70, 120, 210);
-const COLOR_EXHALE_DEEP: (u8, u8, u8) = (200, 135, 55);
-const COLOR_HOLD_DEEP: (u8, u8, u8) = (90, 150, 110);
-
-const LEAD_IN_SECS: f64 = 3.0;
-const PETAL_COUNT: f64 = 6.0;
-const PETAL_DEPTH: f64 = 0.35; // how much petals indent (0 = circle, 1 = star)
-
-/// Cell aspect ratio compensation. Terminal cells are ~2:1 (tall:wide).
+const PETAL_DEPTH: f64 = 0.35;
 const CELL_ASPECT: f64 = 2.1;
+const CLOSING_SECS: f64 = 1.5;
+
+// ── Palette ─────────────────────────────────────────────────────────
+
+struct Palette {
+    inhale: (u8, u8, u8),
+    inhale_deep: (u8, u8, u8),
+    exhale: (u8, u8, u8),
+    exhale_deep: (u8, u8, u8),
+    hold: (u8, u8, u8),
+    hold_deep: (u8, u8, u8),
+}
+
+impl Palette {
+    fn from_config(config: &Config) -> Self {
+        let inhale = arr3(config.colors.inhale);
+        let exhale = arr3(config.colors.exhale);
+        let hold = arr3(config.colors.hold);
+        Self {
+            inhale,
+            inhale_deep: deepen(inhale),
+            exhale,
+            exhale_deep: deepen(exhale),
+            hold,
+            hold_deep: deepen(hold),
+        }
+    }
+
+    fn phase_color_at_depth(&self, phase: &crate::pattern::Phase, depth: f64) -> (u8, u8, u8) {
+        let (base, deep) = if phase.direction > 0.0 {
+            (self.inhale, self.inhale_deep)
+        } else if phase.direction < 0.0 {
+            (self.exhale, self.exhale_deep)
+        } else {
+            (self.hold, self.hold_deep)
+        };
+        (
+            lerp(base.0 as f64, deep.0 as f64, depth) as u8,
+            lerp(base.1 as f64, deep.1 as f64, depth) as u8,
+            lerp(base.2 as f64, deep.2 as f64, depth) as u8,
+        )
+    }
+
+    fn phase_color_raw(&self, phase: &crate::pattern::Phase) -> (u8, u8, u8) {
+        self.phase_color_at_depth(phase, 0.0)
+    }
+}
+
+fn arr3(a: [u8; 3]) -> (u8, u8, u8) {
+    (a[0], a[1], a[2])
+}
+
+/// Push each channel away from the mean — increases color saturation/contrast.
+fn deepen(c: (u8, u8, u8)) -> (u8, u8, u8) {
+    let mean = (c.0 as f64 + c.1 as f64 + c.2 as f64) / 3.0;
+    let f = 1.4;
+    (
+        ((c.0 as f64 - mean) * f + mean).clamp(0.0, 255.0) as u8,
+        ((c.1 as f64 - mean) * f + mean).clamp(0.0, 255.0) as u8,
+        ((c.2 as f64 - mean) * f + mean).clamp(0.0, 255.0) as u8,
+    )
+}
+
+// ── Session state ───────────────────────────────────────────────────
 
 pub struct SessionState {
     pub pattern: Pattern,
@@ -63,18 +115,24 @@ pub struct SessionState {
     curr_color: (u8, u8, u8),
     color_blend: f64,
     pub lead_in_remaining: f64,
+    lead_in_total: f64,
     closing: f64,
     closing_from: f64,
+    /// Fill level captured at the start of each phase (prevents exponential decay)
+    phase_fill_from: f64,
     rotation: f64,
     bell: bool,
+    flash: f64,
     last_tick: Instant,
+    palette: Palette,
+    petal_count: f64,
 }
 
-const CLOSING_SECS: f64 = 1.5;
-
 impl SessionState {
-    pub fn new(pattern: Pattern, rounds: u32, bell: bool) -> Self {
-        let first_color = phase_color_raw(&pattern.phases[0]);
+    pub fn new(pattern: Pattern, rounds: u32, bell: bool, config: &Config) -> Self {
+        let palette = Palette::from_config(config);
+        let first_color = palette.phase_color_raw(&pattern.phases[0]);
+        let lead_in = config.lead_in;
         Self {
             pattern,
             rounds,
@@ -88,12 +146,17 @@ impl SessionState {
             prev_color: COLOR_DIM,
             curr_color: first_color,
             color_blend: 0.0,
-            lead_in_remaining: LEAD_IN_SECS,
+            lead_in_remaining: lead_in,
+            lead_in_total: lead_in,
             closing: 0.0,
             closing_from: 0.0,
+            phase_fill_from: 0.0,
             rotation: 0.0,
             bell,
+            flash: if lead_in > 0.0 { 0.0 } else { 1.0 },
             last_tick: Instant::now(),
+            palette,
+            petal_count: config.petals as f64,
         }
     }
 
@@ -101,6 +164,11 @@ impl SessionState {
         let now = Instant::now();
         let dt = now.duration_since(self.last_tick).as_secs_f64();
         self.last_tick = now;
+
+        // Decay phase-transition flash (~250ms)
+        if self.flash > 0.0 {
+            self.flash = (self.flash - dt / 0.25).max(0.0);
+        }
 
         // Closing animation — smooth shrink from captured start
         if self.closing > 0.0 {
@@ -128,10 +196,13 @@ impl SessionState {
 
         if self.lead_in_remaining > 0.0 {
             self.lead_in_remaining -= dt;
-            self.color_blend = (1.0 - self.lead_in_remaining / LEAD_IN_SECS).clamp(0.0, 1.0);
+            if self.lead_in_total > 0.0 {
+                self.color_blend = (1.0 - self.lead_in_remaining / self.lead_in_total).clamp(0.0, 1.0);
+            }
             self.rotation += dt * 0.08;
             if self.lead_in_remaining <= 0.0 {
-                // Lead-in just ended — bell on first inhale
+                // Lead-in just ended — flash + optional bell on first inhale
+                self.flash = 1.0;
                 if self.bell {
                     eprint!("\x07");
                 }
@@ -150,12 +221,13 @@ impl SessionState {
 
         let phase = &self.pattern.phases[self.current_phase];
         let t = (self.phase_elapsed / phase.duration_secs).clamp(0.0, 1.0);
-        let eased = ease_in_out(t);
 
         if phase.direction != 0.0 {
-            let start = self.fill_at_phase_start();
             let end = self.fill_at_phase_end();
-            self.fill_level = lerp(start, end, eased);
+            // Ease-in-out for both phases. Without easing, a linear radius
+            // decrease looks like a rapid collapse because visual area ~ r^2.
+            let curved = ease_in_out(t);
+            self.fill_level = lerp(self.phase_fill_from, end, curved);
         }
 
         if self.phase_elapsed >= phase.duration_secs {
@@ -166,16 +238,23 @@ impl SessionState {
                 self.current_phase = 0;
                 self.current_round += 1;
 
-                if self.current_round >= self.rounds {
+                if self.rounds > 0 && self.current_round >= self.rounds {
                     self.closing_from = self.fill_level;
                     self.closing = 0.001;
                     return;
                 }
             }
 
+            // Capture fill level at start of new phase
+            self.phase_fill_from = self.fill_level;
             self.prev_color = self.current_color_rgb();
-            self.curr_color = phase_color_at_depth(&self.pattern.phases[self.current_phase], self.depth());
+            let depth = self.depth();
+            self.curr_color = self.palette.phase_color_at_depth(
+                &self.pattern.phases[self.current_phase],
+                depth,
+            );
             self.color_blend = 0.0;
+            self.flash = 1.0;
 
             if self.bell {
                 eprint!("\x07");
@@ -195,15 +274,6 @@ impl SessionState {
             Color::Rgb(COLOR_DONE.0, COLOR_DONE.1, COLOR_DONE.2)
         } else {
             lerp_color(self.prev_color, self.curr_color, self.color_blend)
-        }
-    }
-
-    fn fill_at_phase_start(&self) -> f64 {
-        let phase = &self.pattern.phases[self.current_phase];
-        if phase.direction > 0.0 && self.current_phase == 0 {
-            0.0
-        } else {
-            self.fill_level
         }
     }
 
@@ -231,10 +301,14 @@ impl SessionState {
         self.closing > 0.0 && !self.done
     }
 
-    /// How deep into the session we are (0.0 → 1.0). Ramps up over first half.
+    /// How deep into the session we are (0.0 -> 1.0). Ramps up over first half.
     fn depth(&self) -> f64 {
-        if self.rounds == 0 { return 0.0; }
-        let progress = self.current_round as f64 / self.rounds as f64;
+        let progress = if self.rounds == 0 {
+            // Indefinite: ramp over first 10 rounds, then plateau
+            (self.current_round as f64 / 10.0).min(1.0)
+        } else {
+            self.current_round as f64 / self.rounds as f64
+        };
         // Ease-in: deepens quickly at first, plateaus in second half
         (progress * 2.0).min(1.0).sqrt()
     }
@@ -258,10 +332,10 @@ impl SessionState {
 // ── Flower rendering ──────────────────────────────────────────────
 
 /// Compute the flower's radius at a given angle.
-/// Creates a polar rose with `PETAL_COUNT` petals.
+/// Creates a polar rose with configurable petal count.
 /// Organic variation makes each petal slightly different and shift over time.
-fn flower_radius(angle: f64, base_radius: f64, time: f64) -> f64 {
-    let petal = (angle * PETAL_COUNT).cos().abs();
+fn flower_radius(angle: f64, base_radius: f64, time: f64, petal_count: f64) -> f64 {
+    let petal = (angle * petal_count).cos().abs();
     let petal = petal.powf(0.6);
     // Slow wobble: petals breathe slightly out of sync with each other
     let variation = (angle * 1.3 + time * 0.07).sin() * 0.04;
@@ -270,11 +344,11 @@ fn flower_radius(angle: f64, base_radius: f64, time: f64) -> f64 {
 
 /// Two-level shading: solid core, soft edge. Color does the gradient work.
 fn shade_char(normalized_dist: f64) -> char {
-    if normalized_dist < 0.7 { '█' } else { '░' }
+    if normalized_dist < 0.7 { '\u{2588}' } else { '\u{2591}' }
 }
 
 /// Color intensity based on distance from center.
-/// The curve is shaped so the █→░ transition at 0.7 isn't a visible ring:
+/// The curve is shaped so the solid/light transition at 0.7 isn't a visible ring:
 /// brightness drops faster in the core, then levels off near the boundary.
 fn shade_color(base: (u8, u8, u8), normalized_dist: f64) -> Color {
     let brightness = lerp(1.0, 0.2, normalized_dist.powf(1.4));
@@ -293,6 +367,7 @@ fn render_flower(
     color_rgb: (u8, u8, u8),
     rotation: f64,
     time: f64,
+    petal_count: f64,
 ) -> Vec<Vec<(char, Color)>> {
     let mut grid: Vec<Vec<(char, Color)>> = vec![vec![(' ', Color::Reset); width as usize]; height as usize];
 
@@ -314,7 +389,7 @@ fn render_flower(
             let dist = (dx * dx + dy * dy).sqrt();
             let angle = dy.atan2(dx) + rotation;
 
-            let r = flower_radius(angle, base_radius, time);
+            let r = flower_radius(angle, base_radius, time, petal_count);
 
             if dist < r {
                 let normalized = dist / r;
@@ -357,11 +432,21 @@ fn draw_main(frame: &mut Frame, area: Rect, state: &SessionState) {
         return;
     }
 
-    let color_rgb = if state.done || state.is_closing() {
+    let mut color_rgb = if state.done || state.is_closing() {
         COLOR_DONE
     } else {
         state.current_color_rgb()
     };
+
+    // Phase-transition flash — brief brightening toward white
+    if state.flash > 0.0 {
+        let t = state.flash * 0.4;
+        color_rgb = (
+            lerp(color_rgb.0 as f64, 255.0, t) as u8,
+            lerp(color_rgb.1 as f64, 255.0, t) as u8,
+            lerp(color_rgb.2 as f64, 255.0, t) as u8,
+        );
+    }
 
     // During lead-in, seed pulses at ~1Hz to prime the body's rhythm
     let fill = if state.in_lead_in() {
@@ -371,7 +456,9 @@ fn draw_main(frame: &mut Frame, area: Rect, state: &SessionState) {
         state.fill_level
     };
 
-    let grid = render_flower(flower_w, flower_h, fill, color_rgb, state.rotation, state.total_elapsed);
+    let grid = render_flower(
+        flower_w, flower_h, fill, color_rgb, state.rotation, state.total_elapsed, state.petal_count,
+    );
 
     let lines: Vec<Line> = grid
         .iter()
@@ -397,8 +484,7 @@ fn draw_main(frame: &mut Frame, area: Rect, state: &SessionState) {
         } else if state.paused {
             "paused".to_string()
         } else if state.in_lead_in() {
-            // Dim dot instead of number — the pulse IS the countdown
-            "·".to_string()
+            format!("{}", state.lead_in_remaining.ceil() as u32)
         } else {
             state.pattern.phases[state.current_phase]
                 .name
@@ -430,19 +516,23 @@ fn draw_footer(frame: &mut Frame, area: Rect, state: &SessionState) {
         let footer = Line::from(vec![
             Span::styled(format!(" {elapsed} "), Style::default().fg(dim)),
             Span::raw("   "),
-            Span::styled("↵ again", Style::default().fg(hint)),
-            Span::styled("  ·  ", Style::default().fg(sep)),
+            Span::styled("\u{21b5} again", Style::default().fg(hint)),
+            Span::styled("  \u{00b7}  ", Style::default().fg(sep)),
             Span::styled("q quit", Style::default().fg(hint)),
         ]);
         frame.render_widget(Paragraph::new(footer).alignment(Alignment::Center), area);
         return;
     }
 
-    let round_display = format!(
-        "{}/{}",
-        (state.current_round + 1).min(state.rounds),
-        state.rounds
-    );
+    let round_display = if state.rounds == 0 {
+        format!("{}", state.current_round + 1)
+    } else {
+        format!(
+            "{}/{}",
+            (state.current_round + 1).min(state.rounds),
+            state.rounds
+        )
+    };
 
     let phase = &state.pattern.phases[state.current_phase];
     let remaining = (phase.duration_secs - state.phase_elapsed).max(0.0);
@@ -450,7 +540,7 @@ fn draw_footer(frame: &mut Frame, area: Rect, state: &SessionState) {
 
     let status = format!("{countdown}");
 
-    let bell_indicator = if state.bell { " ♪" } else { "" };
+    let bell_indicator = if state.bell { " \u{266a}" } else { "" };
 
     let footer = Line::from(vec![
         Span::styled(format!(" {status} "), Style::default().fg(color)),
@@ -462,25 +552,6 @@ fn draw_footer(frame: &mut Frame, area: Rect, state: &SessionState) {
     ]);
 
     frame.render_widget(Paragraph::new(footer).alignment(Alignment::Center), area);
-}
-
-fn phase_color_at_depth(phase: &crate::pattern::Phase, depth: f64) -> (u8, u8, u8) {
-    let (base, deep) = if phase.direction > 0.0 {
-        (COLOR_INHALE, COLOR_INHALE_DEEP)
-    } else if phase.direction < 0.0 {
-        (COLOR_EXHALE, COLOR_EXHALE_DEEP)
-    } else {
-        (COLOR_HOLD, COLOR_HOLD_DEEP)
-    };
-    (
-        lerp(base.0 as f64, deep.0 as f64, depth) as u8,
-        lerp(base.1 as f64, deep.1 as f64, depth) as u8,
-        lerp(base.2 as f64, deep.2 as f64, depth) as u8,
-    )
-}
-
-fn phase_color_raw(phase: &crate::pattern::Phase) -> (u8, u8, u8) {
-    phase_color_at_depth(phase, 0.0)
 }
 
 fn format_duration(secs: f64) -> String {

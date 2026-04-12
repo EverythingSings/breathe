@@ -76,13 +76,18 @@ pub fn show_recent(count: usize) {
 
     for line in recent {
         if let Ok(log) = serde_json::from_str::<SessionLog>(line) {
-            let status = if log.completed { " " } else { "*" };
+            let status = if log.completed || log.rounds_target == 0 { " " } else { "*" };
             let mins = log.total_seconds / 60.0;
             let local = log.timestamp.with_timezone(&chrono::Local);
             let date = local.format("%Y-%m-%d %H:%M");
+            let rounds_str = if log.rounds_target == 0 {
+                format!("{} rounds", log.rounds_completed)
+            } else {
+                format!("{}/{} rounds", log.rounds_completed, log.rounds_target)
+            };
             println!(
-                "{status} {date}  {:<10} {}/{} rounds  {:.1}m",
-                log.pattern, log.rounds_completed, log.rounds_target, mins
+                "{status} {date}  {:<10} {:<12} {:.1}m",
+                log.pattern, rounds_str, mins
             );
         }
     }

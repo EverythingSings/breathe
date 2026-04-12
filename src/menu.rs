@@ -8,6 +8,7 @@ use ratatui::{
 };
 use std::time::Duration;
 
+use crate::config::Config;
 use crate::pattern::Preset;
 
 struct MenuItem {
@@ -15,39 +16,63 @@ struct MenuItem {
     name: &'static str,
     ratio: &'static str,
     desc: &'static str,
-    default_rounds: u32,
     /// Total seconds per cycle (sum of all phase durations)
     cycle_secs: f64,
 }
 
 const ITEMS: &[MenuItem] = &[
-    MenuItem { preset: Preset::Calm, name: "calm", ratio: "4:8", desc: "parasympathetic activation", default_rounds: 10, cycle_secs: 12.0 },
-    MenuItem { preset: Preset::Coherent, name: "coherent", ratio: "5.5:5.5", desc: "HRV resonance", default_rounds: 10, cycle_secs: 11.0 },
-    MenuItem { preset: Preset::Sigh, name: "sigh", ratio: "2:1:6", desc: "physiological sigh", default_rounds: 10, cycle_secs: 9.0 },
-    MenuItem { preset: Preset::Box, name: "box", ratio: "4:4:4:4", desc: "balance and focus", default_rounds: 8, cycle_secs: 16.0 },
-    MenuItem { preset: Preset::Energize, name: "energize", ratio: "1.5:1", desc: "rapid sympathetic activation", default_rounds: 30, cycle_secs: 2.5 },
+    MenuItem { preset: Preset::Calm, name: "calm", ratio: "4:8", desc: "parasympathetic activation", cycle_secs: 12.0 },
+    MenuItem { preset: Preset::Coherent, name: "coherent", ratio: "5.5:5.5", desc: "HRV resonance", cycle_secs: 11.0 },
+    MenuItem { preset: Preset::Sigh, name: "sigh", ratio: "2:1:6", desc: "physiological sigh", cycle_secs: 9.0 },
+    MenuItem { preset: Preset::Box, name: "box", ratio: "4:4:4:4", desc: "balance and focus", cycle_secs: 16.0 },
+    MenuItem { preset: Preset::Energize, name: "energize", ratio: "1.5:1", desc: "rapid sympathetic activation", cycle_secs: 2.5 },
 ];
 
 pub struct MenuState {
     pub selected: usize,
     pub chosen: Option<(Preset, u32)>,
     pub quit: bool,
+    pub open_config: bool,
     rounds: [u32; 5],
+    base_rounds: [u32; 5],
 }
 
 impl MenuState {
-    pub fn new() -> Self {
-        let rounds = std::array::from_fn(|i| ITEMS[i].default_rounds);
+    pub fn new(config: &Config) -> Self {
+        let rounds = [
+            config.rounds.calm,
+            config.rounds.coherent,
+            config.rounds.sigh,
+            config.rounds.box_pattern,
+            config.rounds.energize,
+        ];
         Self {
             selected: 0,
             chosen: None,
             quit: false,
+            open_config: false,
             rounds,
+            base_rounds: rounds,
         }
     }
 
     pub fn reset(&mut self) {
         self.chosen = None;
+        self.open_config = false;
+    }
+
+    pub fn reset_from_config(&mut self, config: &Config) {
+        let rounds = [
+            config.rounds.calm,
+            config.rounds.coherent,
+            config.rounds.sigh,
+            config.rounds.box_pattern,
+            config.rounds.energize,
+        ];
+        self.rounds = rounds;
+        self.base_rounds = rounds;
+        self.chosen = None;
+        self.open_config = false;
     }
 
     fn selected_rounds(&self) -> u32 {
@@ -97,7 +122,7 @@ fn draw_menu(frame: &mut Frame, area: Rect, state: &MenuState) {
 
         let is_selected = i == state.selected;
         let rounds = state.rounds[i];
-        let is_default = rounds == item.default_rounds;
+        let is_default = rounds == state.base_rounds[i];
 
         let num = format!("{}", i + 1);
         let cursor = if is_selected { ">" } else { " " };
@@ -121,16 +146,21 @@ fn draw_menu(frame: &mut Frame, area: Rect, state: &MenuState) {
         };
 
         // Rounds + estimated duration
-        let total_secs = rounds as f64 * item.cycle_secs;
-        let duration_str = if total_secs < 60.0 {
-            format!("~{:.0}s", total_secs)
+        let (rounds_str, duration_str) = if rounds == 0 {
+            ("\u{221e}".to_string(), String::new())
         } else {
-            let mins = total_secs / 60.0;
-            if mins < 10.0 {
-                format!("~{:.1}m", mins)
+            let total_secs = rounds as f64 * item.cycle_secs;
+            let dur = if total_secs < 60.0 {
+                format!("~{:.0}s", total_secs)
             } else {
-                format!("~{:.0}m", mins)
-            }
+                let mins = total_secs / 60.0;
+                if mins < 10.0 {
+                    format!("~{:.1}m", mins)
+                } else {
+                    format!("~{:.0}m", mins)
+                }
+            };
+            (format!("{}r", rounds), dur)
         };
 
         let rounds_style = if is_selected && !is_default {
@@ -146,7 +176,7 @@ fn draw_menu(frame: &mut Frame, area: Rect, state: &MenuState) {
             Span::styled(format!(" {cursor} "), name_style),
             Span::styled(format!("{:<12}", item.name), name_style),
             Span::styled(format!("{:<10}", item.ratio), ratio_style),
-            Span::styled(format!("{:<6}", format!("{}r", rounds)), rounds_style),
+            Span::styled(format!("{:<6}", rounds_str), rounds_style),
             Span::styled(format!("{:<7}", duration_str), rounds_style),
             Span::styled(item.desc, desc_style),
         ]);
@@ -165,7 +195,7 @@ fn draw_menu(frame: &mut Frame, area: Rect, state: &MenuState) {
 
 fn draw_footer(frame: &mut Frame, area: Rect) {
     let footer = Paragraph::new(Line::from(Span::styled(
-        "1-5 or ↑↓ enter   ←→ rounds   q quit",
+        "1-5 or \u{2191}\u{2193} enter   \u{2190}\u{2192} rounds   c settings   q quit",
         Style::default().fg(Color::Rgb(50, 50, 55)),
     )))
     .alignment(Alignment::Center);
@@ -195,13 +225,17 @@ pub fn handle_input(state: &mut MenuState) -> Result<(), std::io::Error> {
             }
             KeyCode::Left | KeyCode::Char('h') => {
                 let r = &mut state.rounds[state.selected];
-                if *r > 1 {
+                if *r == 0 {
+                    *r = 99; // ∞ → 99
+                } else if *r > 1 {
                     *r -= 1;
                 }
             }
             KeyCode::Right | KeyCode::Char('l') => {
                 let r = &mut state.rounds[state.selected];
-                if *r < 99 {
+                if *r >= 99 {
+                    *r = 0; // 99 → ∞
+                } else {
                     *r += 1;
                 }
             }
@@ -216,6 +250,9 @@ pub fn handle_input(state: &mut MenuState) -> Result<(), std::io::Error> {
                     let rounds = state.rounds[idx];
                     state.chosen = Some((ITEMS[idx].preset, rounds));
                 }
+            }
+            KeyCode::Char('c') => {
+                state.open_config = true;
             }
             KeyCode::Char('q') | KeyCode::Esc => {
                 state.quit = true;

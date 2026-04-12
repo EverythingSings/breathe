@@ -1,3 +1,5 @@
+mod config;
+mod config_menu;
 mod menu;
 mod pattern;
 mod session;
@@ -22,6 +24,10 @@ struct Cli {
     /// Ring terminal bell on each phase transition (for eyes-closed use)
     #[arg(long, global = true)]
     bell: bool,
+
+    /// Suppress terminal bell even if configured on
+    #[arg(long, global = true, conflicts_with = "bell")]
+    no_bell: bool,
 
     #[command(subcommand)]
     command: Option<Command>,
@@ -84,6 +90,9 @@ fn main() -> std::process::ExitCode {
 
 fn run() -> Result<bool, Box<dyn std::error::Error>> {
     let cli = Cli::parse();
+    let config = config::load();
+    let cli_bell = cli.bell;
+    let cli_no_bell = cli.no_bell;
 
     if let Some(Command::Log { last }) = &cli.command {
         session::show_recent(*last);
@@ -107,14 +116,22 @@ fn run() -> Result<bool, Box<dyn std::error::Error>> {
 
     // Direct subcommand: run once and exit
     if let Some(cmd) = cli.command {
-        let (pat, rounds_override) = resolve_command(cmd)?;
-        let rounds = rounds_override.unwrap_or(pat.default_rounds);
-        let (log, _exit) = run_session(&mut terminal, pat, rounds, cli.bell)?;
+        let bell = if cli_bell { true } else if cli_no_bell { false } else { config.bell };
+        let (pat, rounds_override, preset) = resolve_command(cmd)?;
+        let rounds = rounds_override
+            .or_else(|| preset.map(|p| config.rounds.for_preset(p)))
+            .unwrap_or(pat.default_rounds);
+        let (log, _exit) = run_session(&mut terminal, pat, rounds, bell, &config)?;
 
         disable_raw_mode()?;
         execute!(stdout(), LeaveAlternateScreen)?;
 
-        if log.completed {
+        if log.rounds_target == 0 {
+            println!(
+                "{}  {} rounds  {:.0}s",
+                log.pattern, log.rounds_completed, log.total_seconds
+            );
+        } else if log.completed {
             println!(
                 "{}  {}  {:.0}s",
                 log.pattern, log.rounds_completed, log.total_seconds
@@ -135,7 +152,10 @@ fn run() -> Result<bool, Box<dyn std::error::Error>> {
     }
 
     // Interactive menu: loop until quit
-    let mut menu_state = menu::MenuState::new();
+    let mut config = config;
+    let mut bell = if cli_bell { true } else if cli_no_bell { false } else { config.bell };
+    let mut menu_state = menu::MenuState::new(&config);
+
     loop {
         // Show menu
         loop {
@@ -148,6 +168,20 @@ fn run() -> Result<bool, Box<dyn std::error::Error>> {
                 return Ok(true);
             }
 
+            if menu_state.open_config {
+                terminal.clear()?;
+                config = config_menu::run(&mut terminal, &config)?;
+                if let Err(e) = config::save(&config) {
+                    eprintln!("Warning: could not save config: {e}");
+                }
+                bell = if cli_bell { true } else if cli_no_bell { false } else { config.bell };
+                let selected = menu_state.selected;
+                menu_state.reset_from_config(&config);
+                menu_state.selected = selected;
+                terminal.clear()?;
+                continue;
+            }
+
             if menu_state.chosen.is_some() {
                 break;
             }
@@ -157,7 +191,7 @@ fn run() -> Result<bool, Box<dyn std::error::Error>> {
         let pat = preset.pattern();
 
         terminal.clear()?;
-        let (_log, exit) = run_session(&mut terminal, pat, rounds, cli.bell)?;
+        let (_log, exit) = run_session(&mut terminal, pat, rounds, bell, &config)?;
 
         match exit {
             SessionExit::Quit => {
@@ -183,9 +217,10 @@ fn run_session(
     pat: pattern::Pattern,
     rounds: u32,
     bell: bool,
+    config: &config::Config,
 ) -> Result<(session::SessionLog, SessionExit), Box<dyn std::error::Error>> {
     let pattern_name = pat.name.to_string();
-    let mut state = ui::SessionState::new(pat, rounds, bell);
+    let mut state = ui::SessionState::new(pat, rounds, bell, config);
 
     let start = std::time::Instant::now();
 
@@ -218,16 +253,18 @@ fn run_session(
     Ok((log, exit))
 }
 
-fn resolve_command(cmd: Command) -> Result<(pattern::Pattern, Option<u32>), Box<dyn std::error::Error>> {
+type ResolvedCommand = (pattern::Pattern, Option<u32>, Option<Preset>);
+
+fn resolve_command(cmd: Command) -> Result<ResolvedCommand, Box<dyn std::error::Error>> {
     Ok(match cmd {
-        Command::Calm { rounds } => (Preset::Calm.pattern(), rounds),
-        Command::Coherent { rounds } => (Preset::Coherent.pattern(), rounds),
-        Command::Sigh { rounds } => (Preset::Sigh.pattern(), rounds),
-        Command::Box { rounds } => (Preset::Box.pattern(), rounds),
-        Command::Energize { rounds } => (Preset::Energize.pattern(), rounds),
+        Command::Calm { rounds } => (Preset::Calm.pattern(), rounds, Some(Preset::Calm)),
+        Command::Coherent { rounds } => (Preset::Coherent.pattern(), rounds, Some(Preset::Coherent)),
+        Command::Sigh { rounds } => (Preset::Sigh.pattern(), rounds, Some(Preset::Sigh)),
+        Command::Box { rounds } => (Preset::Box.pattern(), rounds, Some(Preset::Box)),
+        Command::Energize { rounds } => (Preset::Energize.pattern(), rounds, Some(Preset::Energize)),
         Command::Custom { ratio, rounds } => {
             let p = pattern::parse_custom(&ratio)?;
-            (p, rounds)
+            (p, rounds, None)
         }
         Command::Log { .. } => unreachable!(),
     })
