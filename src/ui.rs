@@ -22,6 +22,45 @@ fn ease_in_out(t: f64) -> f64 {
     }
 }
 
+/// Easing strategy chosen per-phase based on neighboring phases.
+/// Adjacent opposite-direction phases get responsive (non-zero velocity)
+/// endpoints so turnarounds are smooth, not stalled.
+#[derive(Debug, Clone, Copy)]
+enum Easing {
+    InOut,    // gentle at both ends (phase bordered by holds)
+    In,       // gentle start, responsive end (approaching turnaround)
+    Out,      // responsive start, gentle end (leaving turnaround)
+    Through,  // responsive at both ends (between two turnarounds)
+}
+
+fn apply_easing(t: f64, easing: Easing) -> f64 {
+    match easing {
+        Easing::InOut => ease_in_out(t),
+        Easing::In => t * t,
+        Easing::Out => 1.0 - (1.0 - t) * (1.0 - t),
+        // Blend: linear keeps endpoints responsive, ease adds organic curvature
+        Easing::Through => 0.5 * t + 0.5 * ease_in_out(t),
+    }
+}
+
+fn phase_easing(phases: &[crate::pattern::Phase], idx: usize) -> Easing {
+    let n = phases.len();
+    let curr = &phases[idx];
+    if curr.direction == 0.0 {
+        return Easing::InOut;
+    }
+    let prev = &phases[(idx + n - 1) % n];
+    let next = &phases[(idx + 1) % n];
+    let from_turn = prev.direction != 0.0 && prev.direction != curr.direction;
+    let into_turn = next.direction != 0.0 && next.direction != curr.direction;
+    match (from_turn, into_turn) {
+        (false, false) => Easing::InOut,
+        (true, false) => Easing::Out,
+        (false, true) => Easing::In,
+        (true, true) => Easing::Through,
+    }
+}
+
 fn lerp_color(a: (u8, u8, u8), b: (u8, u8, u8), t: f64) -> Color {
     let t = t.clamp(0.0, 1.0);
     Color::Rgb(
@@ -120,6 +159,7 @@ pub struct SessionState {
     closing_from: f64,
     /// Fill level captured at the start of each phase (prevents exponential decay)
     phase_fill_from: f64,
+    current_easing: Easing,
     rotation: f64,
     bell: bool,
     flash: f64,
@@ -133,6 +173,7 @@ impl SessionState {
         let palette = Palette::from_config(config);
         let first_color = palette.phase_color_raw(&pattern.phases[0]);
         let lead_in = config.lead_in;
+        let easing = phase_easing(&pattern.phases, 0);
         Self {
             pattern,
             rounds,
@@ -151,6 +192,7 @@ impl SessionState {
             closing: 0.0,
             closing_from: 0.0,
             phase_fill_from: 0.0,
+            current_easing: easing,
             rotation: 0.0,
             bell,
             flash: if lead_in > 0.0 { 0.0 } else { 1.0 },
@@ -226,7 +268,7 @@ impl SessionState {
             let end = self.fill_at_phase_end();
             // Ease-in-out for both phases. Without easing, a linear radius
             // decrease looks like a rapid collapse because visual area ~ r^2.
-            let curved = ease_in_out(t);
+            let curved = apply_easing(t, self.current_easing);
             self.fill_level = lerp(self.phase_fill_from, end, curved);
         }
 
@@ -247,6 +289,7 @@ impl SessionState {
 
             // Capture fill level at start of new phase
             self.phase_fill_from = self.fill_level;
+            self.current_easing = phase_easing(&self.pattern.phases, self.current_phase);
             self.prev_color = self.current_color_rgb();
             let depth = self.depth();
             self.curr_color = self.palette.phase_color_at_depth(
